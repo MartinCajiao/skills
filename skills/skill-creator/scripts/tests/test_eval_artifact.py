@@ -1,7 +1,7 @@
 """Regression tests for the trigger-eval artifact itself.
 
 These tests pin the core invariant behind #1298: auto-trigger evaluation must
-install the candidate as a real skill, not as a slash-command decoy.  If this
+install the candidate as a real skill, not as a slash-command decoy. If this
 regresses back to `.claude/commands`, the harness can once again measure a
 surface that is not present in Claude Code's model-facing skill registry.
 """
@@ -38,7 +38,7 @@ class EvalArtifactTests(unittest.TestCase):
 
     def _create(self, name="pdf", description="Handle PDF documents") -> Path:
         project = create_eval_project(name, description, stale_hours=12.0)
-        self.addCleanup(shutil.rmtree, project, True)
+        self.addCleanup(shutil.rmtree, project, ignore_errors=True)
         return project
 
     def test_candidate_is_installed_as_real_skill(self):
@@ -67,8 +67,12 @@ class EvalArtifactTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(first.parent, self.root)
         self.assertEqual(second.parent, self.root)
-        self.assertTrue((first / ".claude" / "skills" / "pdf" / "SKILL.md").exists())
-        self.assertTrue((second / ".claude" / "skills" / "pdf" / "SKILL.md").exists())
+        self.assertTrue(
+            (first / ".claude" / "skills" / "pdf" / "SKILL.md").exists()
+        )
+        self.assertTrue(
+            (second / ".claude" / "skills" / "pdf" / "SKILL.md").exists()
+        )
 
     def test_artifact_is_never_written_into_callers_project(self):
         caller = Path(self.tmp.name) / "caller-project"
