@@ -151,6 +151,7 @@ def run_single_query(
 
     process = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=eval_project_dir,
