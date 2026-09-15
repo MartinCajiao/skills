@@ -7,9 +7,8 @@ for a set of queries. Outputs results as JSON.
 Mechanism: each run creates an isolated temporary project containing the
 candidate description installed as a real skill at
 <tmp>/.claude/skills/<name>/SKILL.md, and `claude -p` executes with that
-project as its working directory. Skills are the only surface `claude -p`
-exposes to the model for auto-triggering (files under .claude/commands/
-appear in slash_commands but never in the model's available_skills list).
+project as its working directory. Using the standard skill layout makes
+the candidate's installation match the production surface being evaluated.
 Running in a throwaway project keeps the skill's real name (no suffix),
 never touches the user's project, and makes concurrent runs collision-free
 by construction: every run gets its own project directory keyed by a full
@@ -27,6 +26,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -92,6 +92,34 @@ def _pump_lines(stream, sink) -> None:
         sink(None)
 
 
+def _stop_process_tree(process) -> None:
+    """Stop the probe and its tools, including the npm Windows shim's child."""
+    if os.name == "nt":
+        if process.poll() is None:
+            # Killing cmd.exe alone leaves its node.exe child running.
+            try:
+                completed = subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10, check=False,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                if completed.returncode and process.poll() is None:
+                    raise RuntimeError("Could not terminate the Claude process tree")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        process.kill()
+    process.wait(timeout=10)
+
+
 def _tool_use_mentions(eval_skill_name: str, tool_name: str, tool_input: dict) -> bool:
     """Whether a tool_use block is Claude consulting the eval skill.
 
@@ -130,8 +158,8 @@ def run_single_query(
     tool_use referencing the eval skill appears. Other tool calls
     (TodoWrite, Glob, Bash, ...) are ignored rather than treated as
     non-triggers, since Claude often explores before consulting a skill.
-    Returns False only on a terminal `result` event, process exit, or
-    timeout.
+    Returns False on successful completion without a trigger. Execution
+    errors, truncated output and timeouts raise instead of corrupting scores.
     """
     cmd = [
         claude_cli or resolve_claude_cli(),
@@ -156,38 +184,40 @@ def run_single_query(
         stderr=subprocess.PIPE,
         cwd=eval_project_dir,
         env=env,
+        start_new_session=os.name != "nt",
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
 
     # select() only works on sockets on Windows, so stream reading goes
     # through reader threads + a queue, which behaves the same everywhere.
     stdout_queue: Queue = Queue()
     stderr_tail: deque = deque(maxlen=40)
-    threading.Thread(
+    stdout_reader = threading.Thread(
         target=_pump_lines, args=(process.stdout, stdout_queue.put), daemon=True
-    ).start()
-    threading.Thread(
+    )
+    stderr_reader = threading.Thread(
         target=_pump_lines,
         args=(process.stderr, lambda raw: stderr_tail.append(raw) if raw else None),
         daemon=True,
-    ).start()
+    )
+    stdout_reader.start()
+    stderr_reader.start()
 
     def stderr_excerpt() -> str:
         return b"".join(stderr_tail).decode("utf-8", errors="replace").strip()[:500]
 
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     # Track the Skill/Read block currently streaming its input, if any
     pending_tool_name = None
     accumulated_json = ""
 
     try:
         while True:
-            if time.time() > deadline:
-                print(
-                    f"Warning: query timed out after {timeout}s; counting as "
-                    f"not-triggered: {query[:60]}",
-                    file=sys.stderr,
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"Query timed out after {timeout}s: {query[:60]}; "
+                    f"stderr: {stderr_excerpt()}"
                 )
-                return False
 
             try:
                 raw = stdout_queue.get(timeout=0.5)
@@ -195,18 +225,14 @@ def run_single_query(
                 continue
             if raw is None:  # EOF: process finished and output is drained
                 try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    # stdout closed but the process lingers; the finally
-                    # block kills it
-                    return False
-                if process.returncode != 0:
-                    print(
-                        f"Warning: claude -p exited with code {process.returncode} "
-                        f"for query: {query[:60]}\n  stderr: {stderr_excerpt()}",
-                        file=sys.stderr,
-                    )
-                return False
+                    process.wait(timeout=max(0.01, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError("Claude closed stdout but did not exit") from exc
+                stderr_reader.join(timeout=1)
+                raise RuntimeError(
+                    f"Claude exited with code {process.returncode} without a result "
+                    f"for query: {query[:60]}; stderr: {stderr_excerpt()}"
+                )
 
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
@@ -264,12 +290,21 @@ def run_single_query(
                         return True
 
             elif event.get("type") == "result":
+                if event.get("is_error") or event.get("subtype", "").startswith("error"):
+                    raise RuntimeError(
+                        f"Claude evaluation failed: {event.get('subtype', 'error')}; "
+                        f"{event.get('errors', event.get('result', ''))}"
+                    )
                 return False
     finally:
         # Clean up process on any exit path (return, exception, timeout)
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+        _stop_process_tree(process)
+        for reader, stream in (
+            (stdout_reader, process.stdout), (stderr_reader, process.stderr)
+        ):
+            reader.join(timeout=2)
+            if not reader.is_alive():
+                stream.close()
 
 
 def _sweep_stale_eval_projects(stale_hours: float) -> None:
@@ -300,7 +335,8 @@ def _raise_if_shadowed(skill_name: str) -> None:
     it attracts are decided by the wrong description and skew measurement.
     Fail rather than silently return invalid scores or move user files.
     """
-    installed = Path.home() / ".claude" / "skills" / skill_name
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    installed = config_dir / "skills" / skill_name
     if installed.is_dir():
         raise RuntimeError(
             f"Cannot evaluate skill {skill_name!r}: user-level skill at "
@@ -339,7 +375,7 @@ def create_eval_project(
         f"(Temporary trigger-eval artifact created by skill-creator's "
         f"run_eval.py; safe to delete.)\n"
     )
-    (skill_dir / "SKILL.md").write_text(skill_content)
+    (skill_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
     return project_dir
 
 
@@ -399,12 +435,11 @@ def run_eval(
                 try:
                     query_triggers[query].append(future.result())
                 except Exception as e:
-                    print(
-                        f"Warning: query failed ({type(e).__name__}: {e}); "
-                        f"counting as not-triggered: {query[:60]}",
-                        file=sys.stderr,
-                    )
-                    query_triggers[query].append(False)
+                    for pending in future_to_info:
+                        pending.cancel()
+                    raise RuntimeError(
+                        f"Evaluation aborted for query {query[:60]!r}: {e}"
+                    ) from e
     finally:
         shutil.rmtree(eval_project_dir, ignore_errors=True)
 
@@ -466,7 +501,7 @@ def main():
         print(f"Error: No SKILL.md found at {skill_path}", file=sys.stderr)
         sys.exit(1)
 
-    name, original_description, content = parse_skill_md(skill_path)
+    name, original_description, _content = parse_skill_md(skill_path)
     description = args.description or original_description
     project_root = find_project_root()
 

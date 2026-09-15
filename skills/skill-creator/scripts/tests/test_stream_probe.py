@@ -47,6 +47,11 @@ class FakeProcess:
 
 
 class StreamProbeTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch("scripts.run_eval._stop_process_tree")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_orientation_tool_then_skill_still_triggers_and_stdin_is_closed(self):
         output = b"".join(
             [
